@@ -1,11 +1,8 @@
 // api/transcript.js
-// Robust transcript endpoint with three strategies:
-//  1) youtube-transcript (library)
-//  2) ytdl-core (captionTracks)
-//  3) timedtext list -> exact track fetch (VTT or XML)
-// package.json deps:
-//   "youtube-transcript": "^1.2.1",
-//   "ytdl-core": "^4.11.2"
+// Robust transcript endpoint with 3 strategies:
+//  1) youtube-transcript
+//  2) ytdl-core captionTracks
+//  3) timedtext list (tries caps=asr / hl) -> exact track fetch (VTT or XML)
 
 import { YoutubeTranscript } from "youtube-transcript";
 import ytdl from "ytdl-core";
@@ -126,7 +123,6 @@ function parseTimedtextXml(xml) {
 
 /* ---------------------------- strategies ---------------------------- */
 
-// A) youtube-transcript
 async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
   const optionsList = [
     undefined,
@@ -149,7 +145,6 @@ async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
   throw lastErr || new Error("No transcript via youtube-transcript");
 }
 
-// B) ytdl-core
 async function tryYtdl(videoId, preferredLang, attempts) {
   attempts.push("ytdl:info");
   const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
@@ -200,30 +195,39 @@ async function tryYtdl(videoId, preferredLang, attempts) {
   throw new Error(`Caption download failed (last HTTP ${lastStatus ?? "n/a"})`);
 }
 
-// C) timedtext list -> precise track fetch (handles name/kind + VTT/XML)
+/* --- NEW: list with multiple variants to surface auto-generated tracks --- */
 async function listTimedtextTracks(videoId, attempts) {
-  const listUrl = `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1`;
-  attempts.push("timedtext:list");
-  const res = await fetch(listUrl, { headers: BROWSER_HEADERS });
-  const xml = await res.text();
-  if (!res.ok) throw new Error(`timedtext list HTTP ${res.status}`);
+  const variants = [
+    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1`,
+    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&caps=asr`,
+    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&hl=en`,
+    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&caps=asr&hl=en`,
+  ];
 
-  const tracks = [];
-  const trackRe = /<track\b([^>]+)\/>/g;
-  let m;
-  while ((m = trackRe.exec(xml))) {
-    const attrs = {};
-    const attrRe = /(\w+)="([^"]*)"/g;
-    let a;
-    while ((a = attrRe.exec(m[1]))) attrs[a[1]] = a[2];
-    // attrs example: { lang_code, lang_translated, name, kind? (asr) }
-    tracks.push({
-      lang_code: attrs.lang_code,
-      name: attrs.name || "",
-      kind: attrs.kind || "", // "asr" when auto-generated
-    });
+  for (const url of variants) {
+    attempts.push(`timedtext:list ${url.includes("caps=asr") ? "asr" : "base"}${url.includes("&hl=") ? "+hl" : ""}`);
+    const res = await fetch(url, { headers: BROWSER_HEADERS });
+    const xml = await res.text();
+    if (!res.ok) continue;
+
+    const tracks = [];
+    const trackRe = /<track\b([^>]+)\/>/g;
+    let m;
+    while ((m = trackRe.exec(xml))) {
+      const attrs = {};
+      const attrRe = /(\w+)="([^"]*)"/g;
+      let a;
+      while ((a = attrRe.exec(m[1]))) attrs[a[1]] = a[2];
+      tracks.push({
+        lang_code: attrs.lang_code,
+        name: attrs.name || "",
+        kind: attrs.kind || "",
+      });
+    }
+    if (tracks.length) return tracks;
   }
-  return tracks;
+
+  return [];
 }
 
 async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
@@ -232,7 +236,6 @@ async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
 
   const norm = (s) => (s || "").toLowerCase();
 
-  // choose best track (preferred lang > english > first)
   let chosen =
     (preferredLang &&
       tracks.find((t) => norm(t.lang_code).startsWith(norm(preferredLang)))) ||
@@ -240,9 +243,7 @@ async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
     tracks[0];
 
   attempts.push(
-    `timedtext:choose track lang=${chosen.lang_code}, kind=${chosen.kind || "manual"}${
-      chosen.name ? `, name=${chosen.name}` : ""
-    }`
+    `timedtext:choose lang=${chosen.lang_code}, kind=${chosen.kind || "manual"}${chosen.name ? `, name=${chosen.name}` : ""}`
   );
 
   const build = (fmtVtt) => {
@@ -255,7 +256,6 @@ async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
     return u;
   };
 
-  // Try VTT first, then XML
   for (const withVtt of [true, false]) {
     const url = build(withVtt);
     attempts.push(`timedtext:get ${withVtt ? "vtt" : "xml"}`);
@@ -272,14 +272,12 @@ async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
       if (items.length) return items;
     }
   }
-
   throw new Error("timedtext track fetch returned no cues.");
 }
 
 /* ------------------------------ handler ------------------------------ */
 
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -314,8 +312,6 @@ export default async function handler(req, res) {
       srt,
     });
   } catch (err) {
-    return res
-      .status(400)
-      .json({ error: err?.message || "Failed to fetch transcript." });
+    return res.status(400).json({ error: err?.message || "Failed to fetch transcript." });
   }
 }

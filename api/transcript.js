@@ -1,7 +1,10 @@
 // api/transcript.js
 import { YoutubeTranscript } from "youtube-transcript";
+import ytdl from "ytdl-core";
 
-/** Extract a YouTube video ID from a URL or raw ID */
+/** ---------- helpers ---------- **/
+
+// Extract a YouTube video ID from a URL or raw ID
 function extractVideoId(input) {
   const idRe = /^[A-Za-z0-9_-]{10,}$/;
   if (idRe.test(input)) return input.trim();
@@ -14,11 +17,22 @@ function extractVideoId(input) {
       const m = u.pathname.match(/^\/(shorts|live|embed)\/([A-Za-z0-9_-]{10,})/);
       if (m) return m[2];
     }
-  } catch { /* not a URL; ignore */ }
+  } catch { /* not a URL */ }
   throw new Error("Could not extract a YouTube video ID from input.");
 }
 
-/** Convert transcript array to SRT text */
+// Minimal XML entity decode for timedtext
+function decodeHtml(s = "") {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+// Convert transcript items to SRT
 function toSrt(items) {
   const fmt = (t) => {
     const h = String(Math.floor(t / 3600)).padStart(2, "0");
@@ -36,34 +50,83 @@ function toSrt(items) {
     .join("\n");
 }
 
-/** Try ANY available captions first, then English variants */
-async function fetchWithFallback(videoId, preferredLang) {
-  const attempts = [];
+/** ---------- primary fetch paths ---------- **/
 
-  // IMPORTANT: do NOT filter out `undefined` (that is our "ANY" attempt)
+// Path A: try the lightweight library first (ANY, then English variants)
+async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
+  // IMPORTANT: keep `undefined` (means "ANY")
   const optionsList = [
-    undefined,                             // ANY available (often auto-generated)
+    undefined,
     preferredLang ? { lang: preferredLang } : null,
     { lang: "en" },
     { lang: "en-US" },
-    { lang: "en-GB" }
-  ].filter(x => x !== null);               // keep `undefined`, drop only explicit nulls
+    { lang: "en-GB" },
+  ].filter((x) => x !== null);
 
   let lastErr;
   for (const opts of optionsList) {
     try {
-      attempts.push(opts?.lang ? `lang=${opts.lang}` : "any");
+      attempts.push(opts?.lang ? `ytTranscript:lang=${opts.lang}` : "ytTranscript:any");
       const tr = await YoutubeTranscript.fetchTranscript(videoId, opts);
-      if (Array.isArray(tr) && tr.length) return { transcript: tr, attempts };
+      if (Array.isArray(tr) && tr.length) return tr;
     } catch (e) {
       lastErr = e;
     }
   }
-  const msg = lastErr?.message || "No transcript available.";
-  throw new Error(`${msg} Tried: [${attempts.join(", ")}].`);
+  throw lastErr || new Error("No transcript via youtube-transcript");
 }
 
-/** Vercel serverless function */
+// Path B: robust fallback using `ytdl-core` + YouTube timedtext
+async function tryYtdl(videoId, preferredLang, attempts) {
+  attempts.push("ytdl:info");
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const info = await ytdl.getInfo(url);
+  const pr = info.player_response || info.playerResponse;
+  const tracks =
+    pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+
+  if (!tracks.length) {
+    throw new Error("No caption tracks available.");
+  }
+
+  // Pick track: preferred language -> English -> first
+  const norm = (s) => (s || "").toLowerCase();
+  let track =
+    (preferredLang &&
+      tracks.find((t) => norm(t.languageCode).startsWith(norm(preferredLang)))) ||
+    tracks.find((t) => norm(t.languageCode).startsWith("en")) ||
+    tracks[0];
+
+  attempts.push(`ytdl:track=${track.languageCode || track.language || "unknown"}`);
+
+  // Use baseUrl (XML "timedtext"); fetch and parse
+  const timedUrl = track.baseUrl;
+  const res = await fetch(timedUrl);
+  if (!res.ok) throw new Error(`timedtext HTTP ${res.status}`);
+  const xml = await res.text();
+
+  // Parse <text start="…" dur="…">…</text>
+  const re = /<text[^>]*start="([\d.]+)"[^>]*dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
+  const items = [];
+  let m;
+  while ((m = re.exec(xml))) {
+    const startSec = parseFloat(m[1] || "0");
+    const durSec = parseFloat(m[2] || "0");
+    const text = decodeHtml(m[3].replace(/<[^>]+>/g, "")); // strip any tags
+    if (text.trim().length) {
+      items.push({
+        text,
+        offset: Math.round(startSec * 1000),
+        duration: Math.round(durSec * 1000),
+      });
+    }
+  }
+  if (!items.length) throw new Error("Parsed zero caption entries.");
+  return items;
+}
+
+/** ---------- handler ---------- **/
+
 export default async function handler(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -76,9 +139,18 @@ export default async function handler(req, res) {
     if (!url) return res.status(400).json({ error: "Missing 'url'." });
 
     const id = extractVideoId(url);
-    const { transcript, attempts } = await fetchWithFallback(id, lang);
+    const attempts = [];
+    let transcript = null;
 
-    const plainText = transcript.map(t => t.text).join("\n");
+    // A) library fast path
+    try {
+      transcript = await tryYoutubeTranscript(id, lang, attempts);
+    } catch {
+      // B) ytdl-core fallback
+      transcript = await tryYtdl(id, lang, attempts);
+    }
+
+    const plainText = transcript.map((t) => t.text).join("\n");
     const srt = toSrt(transcript);
 
     return res.status(200).json({
@@ -86,9 +158,11 @@ export default async function handler(req, res) {
       tried_order: attempts,
       segments: transcript,
       plain_text: plainText,
-      srt
+      srt,
     });
   } catch (err) {
-    return res.status(400).json({ error: err?.message || "Failed to fetch transcript." });
+    return res
+      .status(400)
+      .json({ error: err?.message || "Failed to fetch transcript." });
   }
 }

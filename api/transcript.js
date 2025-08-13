@@ -1,306 +1,146 @@
-// api/transcript.js
-import { YoutubeTranscript } from "youtube-transcript";
-import ytdl from "ytdl-core";
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>YouTube Transcript – Proof of Concept</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{ --pad:12px; }
+    body{font-family:system-ui,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;}
+    h1{font-size:28px;margin:0 0 14px;}
+    input,button,select{font-size:16px;padding:10px;}
+    input,select{width:100%;box-sizing:border-box;}
+    .row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+    .row > *{flex:1}
+    button{cursor:pointer}
+    pre{white-space:pre-wrap;background:#f6f8fa;padding:12px;border-radius:8px}
+    small{color:#666}
+    .status{height:8px;border-radius:6px;background:#eef2f6;margin-top:10px;overflow:hidden}
+    .bar{height:100%;width:0;background:#5a8dee;transition:width .4s ease}
+    .error{color:#b00020;margin-top:8px}
+    .controls{display:grid;grid-template-columns:1fr auto;gap:12px}
+    @media (max-width:520px){ .controls{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+  <h1>YouTube Transcript – Proof of Concept</h1>
 
-/* ------------------------------ utils ------------------------------ */
-function extractVideoId(input) {
-  const idRe = /^[A-Za-z0-9_-]{10,}$/;
-  if (idRe.test(input)) return input.trim();
-  try {
-    const u = new URL(input);
-    if (u.hostname.includes("youtu.be")) return u.pathname.slice(1);
-    if (u.hostname.includes("youtube.com")) {
-      const v = u.searchParams.get("v");
-      if (v) return v;
-      const m = u.pathname.match(/^\/(shorts|live|embed)\/([A-Za-z0-9_-]{10,})/);
-      if (m) return m[2];
-    }
-  } catch {}
-  throw new Error("Could not extract a YouTube video ID from input.");
+  <div class="controls">
+    <input id="url" type="url" placeholder="Paste YouTube link…" />
+    <select id="lang" title="Preferred language (optional)">
+      <option value="">auto</option>
+      <option value="en">en</option>
+      <option value="en-US">en-US</option>
+      <option value="en-GB">en-GB</option>
+    </select>
+  </div>
+
+  <div class="row" style="margin-top:10px">
+    <button onclick="go()">Get Transcript</button>
+    <button onclick="downloadFmt('txt')">Download .txt</button>
+    <button onclick="downloadFmt('srt')">Download .srt</button>
+    <button onclick="download('json')">Download .json</button>
+  </div>
+
+  <small>Requires captions to be available for the video.</small>
+  <div class="status"><div id="bar" class="bar"></div></div>
+  <div id="msg" class="error"></div>
+  <pre id="out"></pre>
+
+<script>
+/* ----------------- set this to YOUR deployed function url ----------------- */
+// Example: const API_URL = "https://your-project.vercel.app/api/transcript";
+const API_URL = "REPLACE_WITH_YOUR_VERCEL_URL/api/transcript";
+/* ------------------------------------------------------------------------- */
+
+let lastData = null;
+
+function setStatus(pct){ document.getElementById('bar').style.width = pct; }
+function say(html){ document.getElementById('msg').innerHTML = html || ""; }
+function show(obj){
+  const el = document.getElementById('out');
+  el.textContent = obj ? (typeof obj === 'string' ? obj : JSON.stringify(obj,null,2)) : "";
 }
 
-function decodeHtml(s = "") {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+function saveFile(name, text, mime){
+  const blob = new Blob([text], {type: mime});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
-const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  Origin: "https://www.youtube.com",
-  Referer: "https://www.youtube.com/",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache",
-};
+async function go(){
+  const url = document.getElementById('url').value.trim();
+  const lang = document.getElementById('lang').value.trim() || undefined;
 
-function toSrt(items) {
-  const fmt = (t) => {
-    const h = String(Math.floor(t / 3600)).padStart(2, "0");
-    const m = String(Math.floor((t % 3600) / 60)).padStart(2, "0");
-    const s = String(Math.floor(t % 60)).padStart(2, "0");
-    const ms = String(Math.floor((t - Math.floor(t)) * 1000)).padStart(3, "0");
-    return `${h}:${m}:${s},${ms}`;
-  };
-  return items
-    .map((it, i) => {
-      const start = it.offset / 1000;
-      const end = start + (it.duration ?? 0);
-      return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${it.text}\n`;
-    })
-    .join("\n");
-}
+  if(!url){ say("Enter a URL"); return; }
 
-function parseVtt(vtt) {
-  const lines = vtt.split(/\r?\n/);
-  const items = [];
-  let i = 0;
-  const parseTime = (t) => {
-    const parts = t.split(":").map(Number);
-    let h = 0, m = 0, s = 0;
-    if (parts.length === 3) [h, m, s] = parts;
-    else if (parts.length === 2) [m, s] = parts;
-    return h * 3600 + m * 60 + s;
-  };
-  while (i < lines.length) {
-    while (i < lines.length && !lines[i].includes("-->")) i++;
-    if (i >= lines.length) break;
-    const tline = lines[i++].trim();
-    const m = tline.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
-    if (!m) continue;
-    const start = parseTime(m[1]);
-    const end = parseTime(m[2]);
-    const texts = [];
-    while (i < lines.length && lines[i].trim() !== "") texts.push(lines[i++]);
-    while (i < lines.length && lines[i].trim() === "") i++;
-    const text = decodeHtml(texts.join(" ").replace(/<[^>]+>/g, ""));
-    if (text.trim()) {
-      items.push({
-        text,
-        offset: Math.round(start * 1000),
-        duration: Math.max(0, Math.round((end - start) * 1000)),
-      });
-    }
-  }
-  return items;
-}
+  setStatus("35%"); say(""); show(null); lastData = null;
 
-function parseTimedtextXml(xml) {
-  const re = /<text[^>]*start="([\d.]+)"[^>]*dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
-  const items = [];
-  let m;
-  while ((m = re.exec(xml))) {
-    const start = parseFloat(m[1] || "0");
-    const dur = parseFloat(m[2] || "0");
-    const text = decodeHtml((m[3] || "").replace(/<[^>]+>/g, ""));
-    if (text.trim()) {
-      items.push({
-        text,
-        offset: Math.round(start * 1000),
-        duration: Math.round(dur * 1000),
-      });
-    }
-  }
-  return items;
-}
-
-/* ---------------------------- strategies ---------------------------- */
-async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
-  const optionsList = [
-    undefined,
-    preferredLang ? { lang: preferredLang } : null,
-    { lang: "en" },
-    { lang: "en-US" },
-    { lang: "en-GB" },
-  ].filter((x) => x !== null);
-
-  let lastErr;
-  for (const opts of optionsList) {
-    try {
-      attempts.push(opts?.lang ? `ytTranscript:lang=${opts.lang}` : "ytTranscript:any");
-      const tr = await YoutubeTranscript.fetchTranscript(videoId, opts);
-      if (Array.isArray(tr) && tr.length) return tr;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error("No transcript via youtube-transcript");
-}
-
-async function tryYtdl(videoId, preferredLang, attempts) {
-  attempts.push("ytdl:info");
-  const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
-  const pr = info.player_response || info.playerResponse;
-  const tracks =
-    pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-  if (!tracks.length) throw new Error("No caption tracks available.");
-
-  const norm = (s) => (s || "").toLowerCase();
-  let track =
-    (preferredLang &&
-      tracks.find((t) => norm(t.languageCode).startsWith(norm(preferredLang)))) ||
-    tracks.find((t) => norm(t.languageCode).startsWith("en")) ||
-    tracks[0];
-
-  attempts.push(`ytdl:track=${track.languageCode || track.language || "unknown"}`);
-
-  const base = track.baseUrl;
-  const sep = base.includes("?") ? "&" : "?";
-  const candidates = [
-    base,
-    `${base}${sep}fmt=srv3`,
-    `${base}${sep}fmt=vtt`,
-    `${base}${sep}fmt=ttml`,
-    `${base}${sep}fmt=srv1`,
-  ];
-
-  let lastStatus = null;
-  for (const timedUrl of candidates) {
-    try {
-      attempts.push(
-        `ytdl:get=${timedUrl.includes("fmt=") ? timedUrl.split("fmt=").pop() : "base"}`
-      );
-      const res = await fetch(timedUrl, { headers: BROWSER_HEADERS });
-      lastStatus = res.status;
-      if (!res.ok) continue;
-      const body = await res.text();
-      if (/WEBVTT/i.test(body)) {
-        const items = parseVtt(body);
-        if (items.length) return items;
-      }
-      if (/<(timedtext|text)\b/i.test(body)) {
-        const items = parseTimedtextXml(body);
-        if (items.length) return items;
-      }
-    } catch {}
-  }
-  throw new Error(`Caption download failed (last HTTP ${lastStatus ?? "n/a"})`);
-}
-
-async function listTimedtextTracks(videoId, attempts) {
-  const variants = [
-    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1`,
-    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&caps=asr`,
-    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&hl=en`,
-    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&caps=asr&hl=en`,
-  ];
-  for (const url of variants) {
-    attempts.push(`timedtext:list ${url.includes("caps=asr") ? "asr" : "base"}${url.includes("&hl=") ? "+hl" : ""}`);
-    const res = await fetch(url, { headers: BROWSER_HEADERS });
-    const xml = await res.text();
-    if (!res.ok) continue;
-
-    const tracks = [];
-    const trackRe = /<track\b([^>]+)\/>/g;
-    let m;
-    while ((m = trackRe.exec(xml))) {
-      const attrs = {};
-      const attrRe = /(\w+)="([^"]*)"/g;
-      let a;
-      while ((a = attrRe.exec(m[1]))) attrs[a[1]] = a[2];
-      tracks.push({
-        lang_code: attrs.lang_code,
-        name: attrs.name || "",
-        kind: attrs.kind || "",
-      });
-    }
-    if (tracks.length) return tracks;
-  }
-  return [];
-}
-
-async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
-  const tracks = await listTimedtextTracks(videoId, attempts);
-  if (!tracks.length) throw new Error("No tracks in timedtext list.");
-
-  const norm = (s) => (s || "").toLowerCase();
-  let chosen =
-    (preferredLang &&
-      tracks.find((t) => norm(t.lang_code).startsWith(norm(preferredLang)))) ||
-    tracks.find((t) => norm(t.lang_code).startsWith("en")) ||
-    tracks[0];
-
-  attempts.push(
-    `timedtext:choose lang=${chosen.lang_code}, kind=${chosen.kind || "manual"}${chosen.name ? `, name=${chosen.name}` : ""}`
-  );
-
-  const build = (fmtVtt) => {
-    let u = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${encodeURIComponent(
-      chosen.lang_code
-    )}`;
-    if (chosen.kind === "asr") u += `&kind=asr`;
-    if (chosen.name) u += `&name=${encodeURIComponent(chosen.name)}`;
-    if (fmtVtt) u += `&fmt=vtt`;
-    return u;
-  };
-
-  for (const withVtt of [true, false]) {
-    const url = build(withVtt);
-    attempts.push(`timedtext:get ${withVtt ? "vtt" : "xml"}`);
-    const r = await fetch(url, { headers: BROWSER_HEADERS });
-    const body = await r.text();
-    if (!r.ok) continue;
-
-    if (withVtt && /WEBVTT/i.test(body)) {
-      const items = parseVtt(body);
-      if (items.length) return items;
-    }
-    if (!withVtt && /<(transcript|timedtext|text)\b/i.test(body)) {
-      const items = parseTimedtextXml(body);
-      if (items.length) return items;
-    }
-  }
-  throw new Error("timedtext track fetch returned no cues.");
-}
-
-/* ------------------------------ handler ------------------------------ */
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Use POST." });
-
-  // keep attempts in outer scope so we can return them on error
-  const attempts = [];
-  try {
-    const { url, lang } = req.body || {};
-    if (!url) return res.status(400).json({ error: "Missing 'url'." });
-
-    const id = extractVideoId(url);
-    let transcript;
-
-    try {
-      transcript = await tryYoutubeTranscript(id, lang, attempts);
-    } catch {
-      try {
-        transcript = await tryYtdl(id, lang, attempts);
-      } catch {
-        transcript = await tryTimedtextEndpoint(id, lang, attempts);
-      }
-    }
-
-    const plainText = transcript.map((t) => t.text).join("\n");
-    const srt = toSrt(transcript);
-
-    return res.status(200).json({
-      video_id: id,
-      tried_order: attempts,
-      segments: transcript,
-      plain_text: plainText,
-      srt,
+  try{
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ url, lang })
     });
-  } catch (err) {
-    // ⬇️ include attempted steps even on failure
-    return res.status(400).json({
-      error: err?.message || "Failed to fetch transcript.",
-      tried_order: attempts,
-    });
+
+    const data = await res.json().catch(() => ({}));  // always try to parse
+    lastData = data;                                   // save even when failing
+    setStatus("75%");
+
+    if(!res.ok){
+      const tried = Array.isArray(data.tried_order) ? ` Tried: [${data.tried_order.join(" → ")}].` : "";
+      say((data.error || `HTTP ${res.status}`) + tried);
+      show(data);
+      setStatus("0%");
+      return;
+    }
+
+    // success
+    say("");
+    const items = data.segments || [];
+    const plain = items.map(x => x.text).join("\n");
+    lastData.plain_text = plain;               // cache for downloads
+    show(plain);
+    setStatus("0%");
+  }catch(err){
+    lastData = { error: err?.message || String(err) };
+    say(lastData.error);
+    show(lastData);
+    setStatus("0%");
   }
 }
+
+function downloadFmt(kind){
+  if(!lastData || !lastData.segments){
+    say("Fetch a transcript first.");
+    return;
+  }
+  if(kind === 'srt'){
+    const srt = lastData.srt || "";
+    if(!srt){ say("No SRT available."); return; }
+    saveFile("transcript.srt", srt, "text/plain");
+    return;
+  }
+  const txt = (lastData.plain_text || (lastData.segments||[]).map(s=>s.text).join("\n")).trim();
+  if(!txt){ say("No text available."); return; }
+  saveFile("transcript.txt", txt, "text/plain");
+}
+
+function download(kind){
+  if(kind !== 'json') return;
+  const url = document.getElementById('url').value.trim();
+  const lang = document.getElementById('lang').value.trim() || undefined;
+
+  // Always download *something* even if no fetch happened yet
+  const payload = lastData ?? {
+    note: "No fetch attempted yet. Click 'Get Transcript' first to capture the server response.",
+    url, lang, ts: new Date().toISOString()
+  };
+  saveFile("response.json", JSON.stringify(payload, null, 2), "application/json");
+}
+</script>
+</body>
+</html>

@@ -1,6 +1,6 @@
 // api/transcript.js
-// Full serverless endpoint with robust caption fallback.
-// Requires package.json deps:
+// Full serverless endpoint with robust caption fallbacks.
+// package.json deps required:
 //   "youtube-transcript": "^1.2.1",
 //   "ytdl-core": "^4.11.2"
 
@@ -9,7 +9,6 @@ import ytdl from "ytdl-core";
 
 /* ---------------------------- helpers ---------------------------- */
 
-// Extract a YouTube video ID from a URL or raw ID
 function extractVideoId(input) {
   const idRe = /^[A-Za-z0-9_-]{10,}$/;
   if (idRe.test(input)) return input.trim();
@@ -22,11 +21,10 @@ function extractVideoId(input) {
       const m = u.pathname.match(/^\/(shorts|live|embed)\/([A-Za-z0-9_-]{10,})/);
       if (m) return m[2];
     }
-  } catch { /* not a URL */ }
+  } catch {}
   throw new Error("Could not extract a YouTube video ID from input.");
 }
 
-// Minimal HTML/XML entity decode for timedtext
 function decodeHtml(s = "") {
   return s
     .replace(/&amp;/g, "&")
@@ -37,7 +35,6 @@ function decodeHtml(s = "") {
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
 }
 
-// Convert transcript items to SRT
 function toSrt(items) {
   const fmt = (t) => {
     const h = String(Math.floor(t / 3600)).padStart(2, "0");
@@ -55,18 +52,28 @@ function toSrt(items) {
     .join("\n");
 }
 
+const BROWSER_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  Origin: "https://www.youtube.com",
+  Referer: "https://www.youtube.com/",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+};
+
 /* ----------------------- primary fetch paths --------------------- */
 
-// Path A: use the lightweight library first (ANY → English variants)
 async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
-  // Keep `undefined` (means "ANY available")
   const optionsList = [
-    undefined,
+    undefined, // ANY available
     preferredLang ? { lang: preferredLang } : null,
     { lang: "en" },
     { lang: "en-US" },
     { lang: "en-GB" },
-  ].filter((x) => x !== null); // drop only explicit nulls
+  ].filter((x) => x !== null);
 
   let lastErr;
   for (const opts of optionsList) {
@@ -81,7 +88,7 @@ async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
   throw lastErr || new Error("No transcript via youtube-transcript");
 }
 
-// Path B: robust fallback using `ytdl-core` + YouTube timedtext (XML) or WebVTT
+// Fallback B: use ytdl-core to retrieve captionTracks and fetch their baseUrl
 async function tryYtdl(videoId, preferredLang, attempts) {
   attempts.push("ytdl:info");
   const url = `https://www.youtube.com/watch?v=${videoId}`;
@@ -89,12 +96,8 @@ async function tryYtdl(videoId, preferredLang, attempts) {
   const pr = info.player_response || info.playerResponse;
   const tracks =
     pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  if (!tracks.length) throw new Error("No caption tracks available.");
 
-  if (!tracks.length) {
-    throw new Error("No caption tracks available.");
-  }
-
-  // Pick track: preferred language → English → first
   const norm = (s) => (s || "").toLowerCase();
   let track =
     (preferredLang &&
@@ -104,38 +107,30 @@ async function tryYtdl(videoId, preferredLang, attempts) {
 
   attempts.push(`ytdl:track=${track.languageCode || track.language || "unknown"}`);
 
-  // Build URL variants to dodge 410/format quirks
   const base = track.baseUrl;
   const sep = base.includes("?") ? "&" : "?";
   const candidates = [
-    base,                               // as-is (usually XML)
-    `${base}${sep}fmt=srv3`,            // XML (srv3)
-    `${base}${sep}fmt=vtt`,             // WebVTT text
-    `${base}${sep}fmt=ttml`,            // TTML XML
-    `${base}${sep}fmt=srv1`,            // legacy XML
+    base,
+    `${base}${sep}fmt=srv3`,
+    `${base}${sep}fmt=vtt`,
+    `${base}${sep}fmt=ttml`,
+    `${base}${sep}fmt=srv1`,
   ];
 
-  // Browser-like headers help avoid 410s
-  const HEADERS = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-  };
-
-  // Parsers
   const parseTimedtextXml = (xml) => {
-    const re = /<text[^>]*start="([\d.]+)"[^>]*dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
+    const re =
+      /<text[^>]*start="([\d.]+)"[^>]*dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
     const items = [];
     let m;
     while ((m = re.exec(xml))) {
-      const startSec = parseFloat(m[1] || "0");
-      const durSec = parseFloat(m[2] || "0");
+      const start = parseFloat(m[1] || "0");
+      const dur = parseFloat(m[2] || "0");
       const text = decodeHtml((m[3] || "").replace(/<[^>]+>/g, ""));
       if (text.trim()) {
         items.push({
           text,
-          offset: Math.round(startSec * 1000),
-          duration: Math.round(durSec * 1000),
+          offset: Math.round(start * 1000),
+          duration: Math.round(dur * 1000),
         });
       }
     }
@@ -143,9 +138,10 @@ async function tryYtdl(videoId, preferredLang, attempts) {
   };
 
   const parseVttTime = (t) => {
-    // 00:01:02.345  or  01:02.345
     const parts = t.split(":").map(Number);
-    let h = 0, m = 0, s = 0;
+    let h = 0,
+      m = 0,
+      s = 0;
     if (parts.length === 3) [h, m, s] = parts;
     else if (parts.length === 2) [m, s] = parts;
     return h * 3600 + m * 60 + s;
@@ -158,15 +154,13 @@ async function tryYtdl(videoId, preferredLang, attempts) {
     while (i < lines.length) {
       while (i < lines.length && !lines[i].includes("-->")) i++;
       if (i >= lines.length) break;
-      const timeLine = lines[i++].trim();
-      const m = timeLine.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
+      const tline = lines[i++].trim();
+      const m = tline.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
       if (!m) continue;
       const start = parseVttTime(m[1]);
       const end = parseVttTime(m[2]);
       const texts = [];
-      while (i < lines.length && lines[i].trim() !== "") {
-        texts.push(lines[i++]);
-      }
+      while (i < lines.length && lines[i].trim() !== "") texts.push(lines[i++]);
       while (i < lines.length && lines[i].trim() === "") i++;
       const text = decodeHtml(texts.join(" ").replace(/<[^>]+>/g, ""));
       if (text.trim()) {
@@ -180,14 +174,13 @@ async function tryYtdl(videoId, preferredLang, attempts) {
     return items;
   };
 
-  // Try each candidate until one works
   let lastStatus = null;
   for (const timedUrl of candidates) {
     try {
       attempts.push(
         `ytdl:get=${timedUrl.includes("fmt=") ? timedUrl.split("fmt=").pop() : "base"}`
       );
-      const res = await fetch(timedUrl, { headers: HEADERS });
+      const res = await fetch(timedUrl, { headers: BROWSER_HEADERS });
       lastStatus = res.status;
       if (!res.ok) continue;
       const body = await res.text();
@@ -200,13 +193,96 @@ async function tryYtdl(videoId, preferredLang, attempts) {
         const items = parseTimedtextXml(body);
         if (items.length) return items;
       }
-      // Unknown or empty—try next format.
-    } catch {
-      // swallow and try next candidate
-    }
+    } catch {}
   }
 
   throw new Error(`Caption download failed (last HTTP ${lastStatus ?? "n/a"})`);
+}
+
+// Fallback C: hit the public timedtext API directly (with &kind=asr and VTT)
+async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
+  const langs = [
+    preferredLang,
+    "en",
+    "en-US",
+    "en-GB",
+  ].filter(Boolean);
+
+  const parseVttTime = (t) => {
+    const parts = t.split(":").map(Number);
+    let h = 0,
+      m = 0,
+      s = 0;
+    if (parts.length === 3) [h, m, s] = parts;
+    else if (parts.length === 2) [m, s] = parts;
+    return h * 3600 + m * 60 + s;
+  };
+  const parseVtt = (vtt) => {
+    const lines = vtt.split(/\r?\n/);
+    const items = [];
+    let i = 0;
+    while (i < lines.length) {
+      while (i < lines.length && !lines[i].includes("-->")) i++;
+      if (i >= lines.length) break;
+      const tline = lines[i++].trim();
+      const m = tline.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
+      if (!m) continue;
+      const start = parseVttTime(m[1]);
+      const end = parseVttTime(m[2]);
+      const texts = [];
+      while (i < lines.length && lines[i].trim() !== "") texts.push(lines[i++]);
+      while (i < lines.length && lines[i].trim() === "") i++;
+      const text = decodeHtml(texts.join(" ").replace(/<[^>]+>/g, ""));
+      if (text.trim()) {
+        items.push({
+          text,
+          offset: Math.round(start * 1000),
+          duration: Math.max(0, Math.round((end - start) * 1000)),
+        });
+      }
+    }
+    return items;
+  };
+
+  let lastStatus = null;
+
+  for (const lc of langs) {
+    // No kind (manually uploaded)
+    let url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${encodeURIComponent(
+      lc
+    )}&fmt=vtt`;
+    attempts.push(`timedtext:lang=${lc}`);
+    try {
+      let r = await fetch(url, { headers: BROWSER_HEADERS });
+      lastStatus = r.status;
+      if (r.ok) {
+        const body = await r.text();
+        if (/WEBVTT/i.test(body)) {
+          const items = parseVtt(body);
+          if (items.length) return items;
+        }
+      }
+    } catch {}
+
+    // Auto-generated captions often require kind=asr
+    url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${encodeURIComponent(
+      lc
+    )}&kind=asr&fmt=vtt`;
+    attempts.push(`timedtext:lang=${lc}+asr`);
+    try {
+      let r = await fetch(url, { headers: BROWSER_HEADERS });
+      lastStatus = r.status;
+      if (r.ok) {
+        const body = await r.text();
+        if (/WEBVTT/i.test(body)) {
+          const items = parseVtt(body);
+          if (items.length) return items;
+        }
+      }
+    } catch {}
+  }
+
+  throw new Error(`timedtext endpoint failed (last HTTP ${lastStatus ?? "n/a"})`);
 }
 
 /* ------------------------------ handler ------------------------------ */
@@ -226,12 +302,14 @@ export default async function handler(req, res) {
     const attempts = [];
     let transcript;
 
-    // A) try library
     try {
       transcript = await tryYoutubeTranscript(id, lang, attempts);
     } catch {
-      // B) fallback direct
-      transcript = await tryYtdl(id, lang, attempts);
+      try {
+        transcript = await tryYtdl(id, lang, attempts);
+      } catch {
+        transcript = await tryTimedtextEndpoint(id, lang, attempts);
+      }
     }
 
     const plainText = transcript.map((t) => t.text).join("\n");

@@ -1,14 +1,8 @@
 // api/transcript.js
-// Robust transcript endpoint with 3 strategies:
-//  1) youtube-transcript
-//  2) ytdl-core captionTracks
-//  3) timedtext list (tries caps=asr / hl) -> exact track fetch (VTT or XML)
-
 import { YoutubeTranscript } from "youtube-transcript";
 import ytdl from "ytdl-core";
 
 /* ------------------------------ utils ------------------------------ */
-
 function extractVideoId(input) {
   const idRe = /^[A-Za-z0-9_-]{10,}$/;
   if (idRe.test(input)) return input.trim();
@@ -68,17 +62,13 @@ function parseVtt(vtt) {
   const lines = vtt.split(/\r?\n/);
   const items = [];
   let i = 0;
-
   const parseTime = (t) => {
     const parts = t.split(":").map(Number);
-    let h = 0,
-      m = 0,
-      s = 0;
+    let h = 0, m = 0, s = 0;
     if (parts.length === 3) [h, m, s] = parts;
     else if (parts.length === 2) [m, s] = parts;
     return h * 3600 + m * 60 + s;
   };
-
   while (i < lines.length) {
     while (i < lines.length && !lines[i].includes("-->")) i++;
     if (i >= lines.length) break;
@@ -122,7 +112,6 @@ function parseTimedtextXml(xml) {
 }
 
 /* ---------------------------- strategies ---------------------------- */
-
 async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
   const optionsList = [
     undefined,
@@ -195,7 +184,6 @@ async function tryYtdl(videoId, preferredLang, attempts) {
   throw new Error(`Caption download failed (last HTTP ${lastStatus ?? "n/a"})`);
 }
 
-/* --- NEW: list with multiple variants to surface auto-generated tracks --- */
 async function listTimedtextTracks(videoId, attempts) {
   const variants = [
     `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1`,
@@ -203,7 +191,6 @@ async function listTimedtextTracks(videoId, attempts) {
     `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&hl=en`,
     `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1&caps=asr&hl=en`,
   ];
-
   for (const url of variants) {
     attempts.push(`timedtext:list ${url.includes("caps=asr") ? "asr" : "base"}${url.includes("&hl=") ? "+hl" : ""}`);
     const res = await fetch(url, { headers: BROWSER_HEADERS });
@@ -226,7 +213,6 @@ async function listTimedtextTracks(videoId, attempts) {
     }
     if (tracks.length) return tracks;
   }
-
   return [];
 }
 
@@ -235,7 +221,6 @@ async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
   if (!tracks.length) throw new Error("No tracks in timedtext list.");
 
   const norm = (s) => (s || "").toLowerCase();
-
   let chosen =
     (preferredLang &&
       tracks.find((t) => norm(t.lang_code).startsWith(norm(preferredLang)))) ||
@@ -276,19 +261,19 @@ async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
 }
 
 /* ------------------------------ handler ------------------------------ */
-
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST." });
 
+  // keep attempts in outer scope so we can return them on error
+  const attempts = [];
   try {
     const { url, lang } = req.body || {};
     if (!url) return res.status(400).json({ error: "Missing 'url'." });
 
     const id = extractVideoId(url);
-    const attempts = [];
     let transcript;
 
     try {
@@ -312,6 +297,10 @@ export default async function handler(req, res) {
       srt,
     });
   } catch (err) {
-    return res.status(400).json({ error: err?.message || "Failed to fetch transcript." });
+    // ⬇️ include attempted steps even on failure
+    return res.status(400).json({
+      error: err?.message || "Failed to fetch transcript.",
+      tried_order: attempts,
+    });
   }
 }

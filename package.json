@@ -1,1 +1,10 @@
+{
+  "name": "factube-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "youtube-transcript": "^1.2.2"
+  }
+}
 

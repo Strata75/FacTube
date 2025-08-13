@@ -39,13 +39,15 @@ function toSrt(items) {
 /** Try ANY available captions first, then English variants */
 async function fetchWithFallback(videoId, preferredLang) {
   const attempts = [];
+
+  // IMPORTANT: do NOT filter out `undefined` (that is our "ANY" attempt)
   const optionsList = [
-    undefined,                        // ANY available (often auto-generated)
+    undefined,                             // ANY available (often auto-generated)
     preferredLang ? { lang: preferredLang } : null,
     { lang: "en" },
     { lang: "en-US" },
     { lang: "en-GB" }
-  ].filter(Boolean);
+  ].filter(x => x !== null);               // keep `undefined`, drop only explicit nulls
 
   let lastErr;
   for (const opts of optionsList) {

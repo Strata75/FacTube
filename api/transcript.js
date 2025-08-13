@@ -1,11 +1,10 @@
 // api/transcript.js
 import { YoutubeTranscript } from "youtube-transcript";
 
-/** Extract a YouTube video ID from a URL or raw ID */
+// Extract a YouTube video ID from a URL or raw ID
 function extractVideoId(input) {
   const idRe = /^[A-Za-z0-9_-]{10,}$/;
   if (idRe.test(input)) return input.trim();
-
   try {
     const u = new URL(input);
     if (u.hostname.includes("youtu.be")) return u.pathname.slice(1);
@@ -15,13 +14,11 @@ function extractVideoId(input) {
       const m = u.pathname.match(/^\/(shorts|live|embed)\/([A-Za-z0-9_-]{10,})/);
       if (m) return m[2];
     }
-  } catch {
-    /* fall through */
-  }
+  } catch {}
   throw new Error("Could not extract a YouTube video ID from input.");
 }
 
-/** Convert transcript items to SRT */
+// Convert transcript items to SRT
 function toSrt(items) {
   const fmt = (t) => {
     const h = String(Math.floor(t / 3600)).padStart(2, "0");
@@ -30,22 +27,44 @@ function toSrt(items) {
     const ms = String(Math.floor((t - Math.floor(t)) * 1000)).padStart(3, "0");
     return `${h}:${m}:${s},${ms}`;
   };
-
-  return items
-    .map((it, i) => {
-      const start = it.offset / 1000;
-      const end = start + (it.duration ?? 0);
-      return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${it.text}\n`;
-    })
-    .join("\n");
+  return items.map((it, i) => {
+    const start = it.offset / 1000;
+    const end = start + (it.duration ?? 0);
+    return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${it.text}\n`;
+  }).join("\n");
 }
 
-/**
- * Vercel serverless function
- * POST { "url": "<youtube url or id>", "lang": "en" }   // lang optional
- */
+// Try several fetch options (en, region variants, then "any available")
+async function fetchWithFallback(videoId, preferredLang) {
+  const attempts = [];
+
+  const optionsList = [
+    preferredLang ? { lang: preferredLang } : null,
+    { lang: "en" },
+    { lang: "en-US" },
+    { lang: "en-GB" },
+    // accept ANY available track, including auto-generated captions
+    null
+  ].filter(Boolean);
+
+  let lastErr;
+  for (const opts of optionsList) {
+    try {
+      attempts.push(opts?.lang ? `lang=${opts.lang}` : "any");
+      // youtube-transcript accepts undefined/null opts to mean "any"
+      const tr = await YoutubeTranscript.fetchTranscript(videoId, opts);
+      if (Array.isArray(tr) && tr.length) return { transcript: tr, attempts };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  const msg = lastErr?.message || "No transcript available.";
+  const details = attempts.length ? ` Tried: [${attempts.join(", ")}].` : "";
+  throw new Error(msg + details);
+}
+
+// Vercel serverless function
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -56,47 +75,19 @@ export default async function handler(req, res) {
     if (!url) return res.status(400).json({ error: "Missing 'url'." });
 
     const id = extractVideoId(url);
-
-    // Try requested language (if provided), then English, then "any available"
-    let transcript;
-    let tried = [];
-    const tryFetch = async (opts, label) => {
-      tried.push(label);
-      return YoutubeTranscript.fetchTranscript(id, opts);
-    };
-
-    try {
-      if (lang) {
-        transcript = await tryFetch({ lang }, `lang=${lang}`);
-      } else {
-        throw new Error("skip");
-      }
-    } catch {
-      try {
-        transcript = await tryFetch({ lang: "en" }, "lang=en");
-      } catch {
-        // accept auto-generated or any available language
-        transcript = await tryFetch(undefined, "any");
-      }
-    }
-
-    if (!Array.isArray(transcript) || transcript.length === 0) {
-      throw new Error("No transcript returned.");
-    }
+    const { transcript, attempts } = await fetchWithFallback(id, lang);
 
     const plainText = transcript.map(t => t.text).join("\n");
     const srt = toSrt(transcript);
 
     return res.status(200).json({
       video_id: id,
-      tried_order: tried,      // helpful for debugging which branch succeeded
+      tried_order: attempts,
       segments: transcript,
       plain_text: plainText,
       srt
     });
   } catch (err) {
-    return res.status(400).json({
-      error: err?.message || "Failed to fetch transcript."
-    });
+    return res.status(400).json({ error: err?.message || "Failed to fetch transcript." });
   }
 }

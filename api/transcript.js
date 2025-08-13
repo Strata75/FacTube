@@ -5,29 +5,20 @@ import { YoutubeTranscript } from "youtube-transcript";
 function extractVideoId(input) {
   const idRe = /^[A-Za-z0-9_-]{10,}$/;
   if (idRe.test(input)) return input.trim();
-
   try {
     const u = new URL(input);
-    // youtu.be/<id>
     if (u.hostname.includes("youtu.be")) return u.pathname.slice(1);
-
     if (u.hostname.includes("youtube.com")) {
-      // youtube.com/watch?v=<id>
       const v = u.searchParams.get("v");
       if (v) return v;
-
-      // shorts/live/embed/<id>
       const m = u.pathname.match(/^\/(shorts|live|embed)\/([A-Za-z0-9_-]{10,})/);
       if (m) return m[2];
     }
-  } catch {
-    /* not a URL; fall through */
-  }
-
+  } catch { /* not a URL; ignore */ }
   throw new Error("Could not extract a YouTube video ID from input.");
 }
 
-/** Convert transcript items to SRT text */
+/** Convert transcript array to SRT text */
 function toSrt(items) {
   const fmt = (t) => {
     const h = String(Math.floor(t / 3600)).padStart(2, "0");
@@ -36,7 +27,6 @@ function toSrt(items) {
     const ms = String(Math.floor((t - Math.floor(t)) * 1000)).padStart(3, "0");
     return `${h}:${m}:${s},${ms}`;
   };
-
   return items
     .map((it, i) => {
       const start = it.offset / 1000;
@@ -46,24 +36,19 @@ function toSrt(items) {
     .join("\n");
 }
 
-/**
- * Try several fetch options:
- *  - preferred language (if provided)
- *  - English variants
- *  - ANY available (undefined opts)
- *  - as a final fallback: list available tracks and fetch the first explicitly
- */
+/** Try ANY available captions first, then English variants */
 async function fetchWithFallback(videoId, preferredLang) {
   const attempts = [];
-  const optsList = [];
-
-  if (preferredLang) optsList.push({ lang: preferredLang });
-  optsList.push({ lang: "en" }, { lang: "en-US" }, { lang: "en-GB" }, undefined); // <-- undefined = ANY
+  const optionsList = [
+    undefined,                        // ANY available (often auto-generated)
+    preferredLang ? { lang: preferredLang } : null,
+    { lang: "en" },
+    { lang: "en-US" },
+    { lang: "en-GB" }
+  ].filter(Boolean);
 
   let lastErr;
-
-  // 1) Preferred/en variants, then ANY
-  for (const opts of optsList) {
+  for (const opts of optionsList) {
     try {
       attempts.push(opts?.lang ? `lang=${opts.lang}` : "any");
       const tr = await YoutubeTranscript.fetchTranscript(videoId, opts);
@@ -72,29 +57,8 @@ async function fetchWithFallback(videoId, preferredLang) {
       lastErr = e;
     }
   }
-
-  // 2) Final fallback: enumerate tracks, fetch the first explicitly
-  try {
-    const tracks = await YoutubeTranscript.listTranscript(videoId);
-    if (Array.isArray(tracks) && tracks.length) {
-      const first = tracks[0];
-      const langCode =
-        first.languageCode || first.lang || first.language || first.code;
-      attempts.push(`list:${langCode || "unknown"}`);
-
-      const tr = await YoutubeTranscript.fetchTranscript(
-        videoId,
-        langCode ? { lang: langCode } : undefined
-      );
-      if (Array.isArray(tr) && tr.length) return { transcript: tr, attempts };
-    }
-  } catch (e) {
-    lastErr = e;
-  }
-
   const msg = lastErr?.message || "No transcript available.";
-  const details = attempts.length ? ` Tried: [${attempts.join(", ")}].` : "";
-  throw new Error(msg + details);
+  throw new Error(`${msg} Tried: [${attempts.join(", ")}].`);
 }
 
 /** Vercel serverless function */
@@ -123,8 +87,6 @@ export default async function handler(req, res) {
       srt
     });
   } catch (err) {
-    return res.status(400).json({
-      error: err?.message || "Failed to fetch transcript."
-    });
+    return res.status(400).json({ error: err?.message || "Failed to fetch transcript." });
   }
 }

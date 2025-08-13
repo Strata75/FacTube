@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "youtube-transcript": "^1.2.2"
+    "youtube-transcript": "1.2.1"
   }
 }
-

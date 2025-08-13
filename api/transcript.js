@@ -1,13 +1,16 @@
 // api/transcript.js
-// Full serverless endpoint with robust caption fallbacks.
-// package.json deps required:
+// Robust transcript endpoint with three strategies:
+//  1) youtube-transcript (library)
+//  2) ytdl-core (captionTracks)
+//  3) timedtext list -> exact track fetch (VTT or XML)
+// package.json deps:
 //   "youtube-transcript": "^1.2.1",
 //   "ytdl-core": "^4.11.2"
 
 import { YoutubeTranscript } from "youtube-transcript";
 import ytdl from "ytdl-core";
 
-/* ---------------------------- helpers ---------------------------- */
+/* ------------------------------ utils ------------------------------ */
 
 function extractVideoId(input) {
   const idRe = /^[A-Za-z0-9_-]{10,}$/;
@@ -35,6 +38,18 @@ function decodeHtml(s = "") {
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
 }
 
+const BROWSER_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  Origin: "https://www.youtube.com",
+  Referer: "https://www.youtube.com/",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+};
+
 function toSrt(items) {
   const fmt = (t) => {
     const h = String(Math.floor(t / 3600)).padStart(2, "0");
@@ -52,23 +67,69 @@ function toSrt(items) {
     .join("\n");
 }
 
-const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  Origin: "https://www.youtube.com",
-  Referer: "https://www.youtube.com/",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache",
-};
+function parseVtt(vtt) {
+  const lines = vtt.split(/\r?\n/);
+  const items = [];
+  let i = 0;
 
-/* ----------------------- primary fetch paths --------------------- */
+  const parseTime = (t) => {
+    const parts = t.split(":").map(Number);
+    let h = 0,
+      m = 0,
+      s = 0;
+    if (parts.length === 3) [h, m, s] = parts;
+    else if (parts.length === 2) [m, s] = parts;
+    return h * 3600 + m * 60 + s;
+  };
 
+  while (i < lines.length) {
+    while (i < lines.length && !lines[i].includes("-->")) i++;
+    if (i >= lines.length) break;
+    const tline = lines[i++].trim();
+    const m = tline.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
+    if (!m) continue;
+    const start = parseTime(m[1]);
+    const end = parseTime(m[2]);
+    const texts = [];
+    while (i < lines.length && lines[i].trim() !== "") texts.push(lines[i++]);
+    while (i < lines.length && lines[i].trim() === "") i++;
+    const text = decodeHtml(texts.join(" ").replace(/<[^>]+>/g, ""));
+    if (text.trim()) {
+      items.push({
+        text,
+        offset: Math.round(start * 1000),
+        duration: Math.max(0, Math.round((end - start) * 1000)),
+      });
+    }
+  }
+  return items;
+}
+
+function parseTimedtextXml(xml) {
+  const re = /<text[^>]*start="([\d.]+)"[^>]*dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
+  const items = [];
+  let m;
+  while ((m = re.exec(xml))) {
+    const start = parseFloat(m[1] || "0");
+    const dur = parseFloat(m[2] || "0");
+    const text = decodeHtml((m[3] || "").replace(/<[^>]+>/g, ""));
+    if (text.trim()) {
+      items.push({
+        text,
+        offset: Math.round(start * 1000),
+        duration: Math.round(dur * 1000),
+      });
+    }
+  }
+  return items;
+}
+
+/* ---------------------------- strategies ---------------------------- */
+
+// A) youtube-transcript
 async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
   const optionsList = [
-    undefined, // ANY available
+    undefined,
     preferredLang ? { lang: preferredLang } : null,
     { lang: "en" },
     { lang: "en-US" },
@@ -88,11 +149,10 @@ async function tryYoutubeTranscript(videoId, preferredLang, attempts) {
   throw lastErr || new Error("No transcript via youtube-transcript");
 }
 
-// Fallback B: use ytdl-core to retrieve captionTracks and fetch their baseUrl
+// B) ytdl-core
 async function tryYtdl(videoId, preferredLang, attempts) {
   attempts.push("ytdl:info");
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const info = await ytdl.getInfo(url);
+  const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
   const pr = info.player_response || info.playerResponse;
   const tracks =
     pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
@@ -117,63 +177,6 @@ async function tryYtdl(videoId, preferredLang, attempts) {
     `${base}${sep}fmt=srv1`,
   ];
 
-  const parseTimedtextXml = (xml) => {
-    const re =
-      /<text[^>]*start="([\d.]+)"[^>]*dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
-    const items = [];
-    let m;
-    while ((m = re.exec(xml))) {
-      const start = parseFloat(m[1] || "0");
-      const dur = parseFloat(m[2] || "0");
-      const text = decodeHtml((m[3] || "").replace(/<[^>]+>/g, ""));
-      if (text.trim()) {
-        items.push({
-          text,
-          offset: Math.round(start * 1000),
-          duration: Math.round(dur * 1000),
-        });
-      }
-    }
-    return items;
-  };
-
-  const parseVttTime = (t) => {
-    const parts = t.split(":").map(Number);
-    let h = 0,
-      m = 0,
-      s = 0;
-    if (parts.length === 3) [h, m, s] = parts;
-    else if (parts.length === 2) [m, s] = parts;
-    return h * 3600 + m * 60 + s;
-  };
-
-  const parseVtt = (vtt) => {
-    const lines = vtt.split(/\r?\n/);
-    const items = [];
-    let i = 0;
-    while (i < lines.length) {
-      while (i < lines.length && !lines[i].includes("-->")) i++;
-      if (i >= lines.length) break;
-      const tline = lines[i++].trim();
-      const m = tline.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
-      if (!m) continue;
-      const start = parseVttTime(m[1]);
-      const end = parseVttTime(m[2]);
-      const texts = [];
-      while (i < lines.length && lines[i].trim() !== "") texts.push(lines[i++]);
-      while (i < lines.length && lines[i].trim() === "") i++;
-      const text = decodeHtml(texts.join(" ").replace(/<[^>]+>/g, ""));
-      if (text.trim()) {
-        items.push({
-          text,
-          offset: Math.round(start * 1000),
-          duration: Math.max(0, Math.round((end - start) * 1000)),
-        });
-      }
-    }
-    return items;
-  };
-
   let lastStatus = null;
   for (const timedUrl of candidates) {
     try {
@@ -184,7 +187,6 @@ async function tryYtdl(videoId, preferredLang, attempts) {
       lastStatus = res.status;
       if (!res.ok) continue;
       const body = await res.text();
-
       if (/WEBVTT/i.test(body)) {
         const items = parseVtt(body);
         if (items.length) return items;
@@ -195,94 +197,83 @@ async function tryYtdl(videoId, preferredLang, attempts) {
       }
     } catch {}
   }
-
   throw new Error(`Caption download failed (last HTTP ${lastStatus ?? "n/a"})`);
 }
 
-// Fallback C: hit the public timedtext API directly (with &kind=asr and VTT)
+// C) timedtext list -> precise track fetch (handles name/kind + VTT/XML)
+async function listTimedtextTracks(videoId, attempts) {
+  const listUrl = `https://www.youtube.com/api/timedtext?type=list&v=${videoId}&tlangs=1`;
+  attempts.push("timedtext:list");
+  const res = await fetch(listUrl, { headers: BROWSER_HEADERS });
+  const xml = await res.text();
+  if (!res.ok) throw new Error(`timedtext list HTTP ${res.status}`);
+
+  const tracks = [];
+  const trackRe = /<track\b([^>]+)\/>/g;
+  let m;
+  while ((m = trackRe.exec(xml))) {
+    const attrs = {};
+    const attrRe = /(\w+)="([^"]*)"/g;
+    let a;
+    while ((a = attrRe.exec(m[1]))) attrs[a[1]] = a[2];
+    // attrs example: { lang_code, lang_translated, name, kind? (asr) }
+    tracks.push({
+      lang_code: attrs.lang_code,
+      name: attrs.name || "",
+      kind: attrs.kind || "", // "asr" when auto-generated
+    });
+  }
+  return tracks;
+}
+
 async function tryTimedtextEndpoint(videoId, preferredLang, attempts) {
-  const langs = [
-    preferredLang,
-    "en",
-    "en-US",
-    "en-GB",
-  ].filter(Boolean);
+  const tracks = await listTimedtextTracks(videoId, attempts);
+  if (!tracks.length) throw new Error("No tracks in timedtext list.");
 
-  const parseVttTime = (t) => {
-    const parts = t.split(":").map(Number);
-    let h = 0,
-      m = 0,
-      s = 0;
-    if (parts.length === 3) [h, m, s] = parts;
-    else if (parts.length === 2) [m, s] = parts;
-    return h * 3600 + m * 60 + s;
+  const norm = (s) => (s || "").toLowerCase();
+
+  // choose best track (preferred lang > english > first)
+  let chosen =
+    (preferredLang &&
+      tracks.find((t) => norm(t.lang_code).startsWith(norm(preferredLang)))) ||
+    tracks.find((t) => norm(t.lang_code).startsWith("en")) ||
+    tracks[0];
+
+  attempts.push(
+    `timedtext:choose track lang=${chosen.lang_code}, kind=${chosen.kind || "manual"}${
+      chosen.name ? `, name=${chosen.name}` : ""
+    }`
+  );
+
+  const build = (fmtVtt) => {
+    let u = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${encodeURIComponent(
+      chosen.lang_code
+    )}`;
+    if (chosen.kind === "asr") u += `&kind=asr`;
+    if (chosen.name) u += `&name=${encodeURIComponent(chosen.name)}`;
+    if (fmtVtt) u += `&fmt=vtt`;
+    return u;
   };
-  const parseVtt = (vtt) => {
-    const lines = vtt.split(/\r?\n/);
-    const items = [];
-    let i = 0;
-    while (i < lines.length) {
-      while (i < lines.length && !lines[i].includes("-->")) i++;
-      if (i >= lines.length) break;
-      const tline = lines[i++].trim();
-      const m = tline.match(/([\d:.]+)\s*-->\s*([\d:.]+)/);
-      if (!m) continue;
-      const start = parseVttTime(m[1]);
-      const end = parseVttTime(m[2]);
-      const texts = [];
-      while (i < lines.length && lines[i].trim() !== "") texts.push(lines[i++]);
-      while (i < lines.length && lines[i].trim() === "") i++;
-      const text = decodeHtml(texts.join(" ").replace(/<[^>]+>/g, ""));
-      if (text.trim()) {
-        items.push({
-          text,
-          offset: Math.round(start * 1000),
-          duration: Math.max(0, Math.round((end - start) * 1000)),
-        });
-      }
+
+  // Try VTT first, then XML
+  for (const withVtt of [true, false]) {
+    const url = build(withVtt);
+    attempts.push(`timedtext:get ${withVtt ? "vtt" : "xml"}`);
+    const r = await fetch(url, { headers: BROWSER_HEADERS });
+    const body = await r.text();
+    if (!r.ok) continue;
+
+    if (withVtt && /WEBVTT/i.test(body)) {
+      const items = parseVtt(body);
+      if (items.length) return items;
     }
-    return items;
-  };
-
-  let lastStatus = null;
-
-  for (const lc of langs) {
-    // No kind (manually uploaded)
-    let url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${encodeURIComponent(
-      lc
-    )}&fmt=vtt`;
-    attempts.push(`timedtext:lang=${lc}`);
-    try {
-      let r = await fetch(url, { headers: BROWSER_HEADERS });
-      lastStatus = r.status;
-      if (r.ok) {
-        const body = await r.text();
-        if (/WEBVTT/i.test(body)) {
-          const items = parseVtt(body);
-          if (items.length) return items;
-        }
-      }
-    } catch {}
-
-    // Auto-generated captions often require kind=asr
-    url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${encodeURIComponent(
-      lc
-    )}&kind=asr&fmt=vtt`;
-    attempts.push(`timedtext:lang=${lc}+asr`);
-    try {
-      let r = await fetch(url, { headers: BROWSER_HEADERS });
-      lastStatus = r.status;
-      if (r.ok) {
-        const body = await r.text();
-        if (/WEBVTT/i.test(body)) {
-          const items = parseVtt(body);
-          if (items.length) return items;
-        }
-      }
-    } catch {}
+    if (!withVtt && /<(transcript|timedtext|text)\b/i.test(body)) {
+      const items = parseTimedtextXml(body);
+      if (items.length) return items;
+    }
   }
 
-  throw new Error(`timedtext endpoint failed (last HTTP ${lastStatus ?? "n/a"})`);
+  throw new Error("timedtext track fetch returned no cues.");
 }
 
 /* ------------------------------ handler ------------------------------ */

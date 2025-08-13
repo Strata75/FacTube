@@ -1,9 +1,10 @@
 {
-  "name": "factube-api",
-  "version": "1.0.0",
+  "name": "factube",
   "private": true,
   "type": "module",
+  "version": "0.0.1",
   "dependencies": {
-    "youtube-transcript": "1.2.1"
+    "youtube-transcript": "^1.2.1",
+    "ytdl-core": "^4.11.2"
   }
 }
